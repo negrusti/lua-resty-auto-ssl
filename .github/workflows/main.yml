@@ -23,7 +23,7 @@ jobs:
           - openresty1.13
           - lua51
     steps:
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
       - name: Build Container
         run: docker-compose build ${{ matrix.variant }}
       - name: Lint
@@ -37,7 +37,8 @@ jobs:
           docker cp ${{ matrix.variant }}-test:/tmp/resty-auto-ssl-test /tmp/resty-auto-ssl-test
       - name: Upload Artifacts
         if: always()
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         with:
           name: "${{ matrix.variant }}-logs"
           path: /tmp/resty-auto-ssl-test
+          if-no-files-found: ignore
