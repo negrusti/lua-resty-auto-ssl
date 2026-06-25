@@ -94,11 +94,15 @@ function _M.issue_cert_lock(self, domain)
   local key = domain .. ":issue_cert_lock"
   local lock_rand_value = str.to_hex(resty_random.bytes(32))
 
-  -- Wait up to 30 seconds for any existing locks to be unlocked.
+  -- Wait for any existing lock to clear before barging in. This must exceed the
+  -- worst-case issuance time (dehydrated can run up to 60s, see shell_execute's
+  -- timeout) so we wait out an in-progress issuance for the same domain rather
+  -- than starting a second, concurrent ACME order for it (which races the
+  -- order's authorizations and causes finalize "unauthorized" errors).
   local unlocked = false
   local wait_time = 0
   local sleep_time = 0.5
-  local max_time = 30
+  local max_time = 90
   repeat
     local existing_value = self.adapter:get(key)
     if not existing_value then
@@ -109,8 +113,10 @@ function _M.issue_cert_lock(self, domain)
     end
   until unlocked or wait_time > max_time
 
-  -- Create a new lock.
-  local ok, err = self.adapter:set(key, lock_rand_value, { exptime = 30 })
+  -- Create a new lock. The expiry is a safety net to auto-release if the holder
+  -- dies; it must outlive a full issuance (up to ~60s) so it isn't released
+  -- while issuance is still in progress.
+  local ok, err = self.adapter:set(key, lock_rand_value, { exptime = 120 })
   if not ok then
     return nil, err
   else

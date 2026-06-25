@@ -63,7 +63,10 @@ end
 local function issue_cert(auto_ssl_instance, storage, domain)
   -- Before issuing a cert, create a local lock to ensure multiple workers
   -- don't simultaneously try to register the same cert.
-  local local_lock, new_local_lock_err = lock:new("auto_ssl", { exptime = 30, timeout = 30 })
+  -- exptime must outlive a full issuance (dehydrated can run up to ~60s) so the
+  -- lock isn't auto-released mid-issuance, which would let a second concurrent
+  -- order start for the same domain and race its ACME authorizations.
+  local local_lock, new_local_lock_err = lock:new("auto_ssl", { exptime = 120, timeout = 30 })
   if new_local_lock_err then
     ngx.log(ngx.ERR, "auto-ssl: failed to create lock: ", new_local_lock_err)
     return

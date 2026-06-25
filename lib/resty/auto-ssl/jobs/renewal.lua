@@ -59,7 +59,10 @@ end
 local function renew_check_cert(auto_ssl_instance, storage, domain)
   -- Before issuing a cert, create a local lock to ensure multiple workers
   -- don't simultaneously try to register the same cert.
-  local local_lock, new_local_lock_err = lock:new("auto_ssl", { exptime = 30, timeout = 30 })
+  -- exptime must outlive a full issuance (dehydrated can run up to ~60s) so the
+  -- lock isn't auto-released mid-issuance, which would let a second concurrent
+  -- order start for the same domain and race its ACME authorizations.
+  local local_lock, new_local_lock_err = lock:new("auto_ssl", { exptime = 120, timeout = 30 })
   if new_local_lock_err then
     ngx.log(ngx.ERR, "auto-ssl: failed to create lock: ", new_local_lock_err)
     return
@@ -191,8 +194,13 @@ local function renew_check_cert(auto_ssl_instance, storage, domain)
       -- limit window clears.
       ngx.log(ngx.NOTICE, "auto-ssl: renewal deferred, ACME rate limit reached: ", domain)
     else
+      -- Keep the existing cert (even if expired) and retry on a later
+      -- request/sweep rather than deleting it. A failed renewal usually can't be
+      -- recovered by dropping to on-demand issuance (same ACME path), so
+      -- deleting would only swap an expired-but-real cert for the fallback and
+      -- discard the stored cert/key. Transient failures (e.g. a finalize race)
+      -- simply succeed on the next attempt.
       ngx.log(ngx.ERR, "auto-ssl: issuing renewal certificate failed: ", issue_err)
-      delete_cert_if_expired(domain, storage, cert)
     end
   else
     -- Log success at NOTICE so completed renewals are visible (issue_cert
