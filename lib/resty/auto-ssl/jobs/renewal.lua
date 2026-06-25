@@ -1,3 +1,4 @@
+local concurrency = require "resty.auto-ssl.utils.concurrency"
 local lock = require "resty.lock"
 local parse_openssl_time = require "resty.auto-ssl.utils.parse_openssl_time"
 local shell_execute = require "resty.auto-ssl.utils.shell_execute"
@@ -267,32 +268,14 @@ local function renew(premature, auto_ssl_instance)
   end
 end
 
--- Cap the number of on-demand renewals running at once. Each renewal shells
--- out via sockproc, so an unbounded burst (many domains being hit at the same
--- time) can exceed sockproc's accept backlog and get "connection reset by
--- peer". This also naturally throttles the ACME request rate against Let's
--- Encrypt's limits. Tune RENEW_MAX_CONCURRENCY to trade renewal throughput
--- against load.
-local RENEW_MAX_CONCURRENCY = 5
--- Slots are held in the shared dict with a TTL so they auto-release even if a
--- worker dies mid-renewal (preventing the concurrency budget from leaking).
+-- On-demand renewals are capped to `renew_max_concurrency` running at once.
+-- Each renewal shells out via sockproc, so an unbounded burst (many domains
+-- being hit at the same time) can exceed sockproc's accept backlog and get
+-- "connection reset by peer". This also naturally throttles the ACME request
+-- rate against Let's Encrypt's limits. The slots are held in the shared dict
+-- with a TTL so they auto-release even if a worker dies mid-renewal
+-- (preventing the concurrency budget from leaking).
 local RENEW_SLOT_TTL = 300
-
-local function acquire_renew_slot()
-  for i = 1, RENEW_MAX_CONCURRENCY do
-    local ok = ngx.shared.auto_ssl:add("renew_slot:" .. i, true, RENEW_SLOT_TTL)
-    if ok then
-      return i
-    end
-  end
-  return nil
-end
-
-local function release_renew_slot(slot)
-  if slot then
-    ngx.shared.auto_ssl:delete("renew_slot:" .. slot)
-  end
-end
 
 -- Timer callback to renew a single domain immediately, using the same locking
 -- and renewal logic as the periodic sweep. Intended to be triggered from a
@@ -300,7 +283,7 @@ end
 -- renewal window (see ssl_certificate.lua).
 local function renew_single_domain(premature, auto_ssl_instance, domain, slot)
   if premature then
-    release_renew_slot(slot)
+    concurrency.release("renew_slot:", slot)
     return
   end
 
@@ -309,22 +292,22 @@ local function renew_single_domain(premature, auto_ssl_instance, domain, slot)
     ngx.log(ngx.ERR, "auto-ssl: failed to run on-demand renewal for ", domain, ": ", renew_err)
   end
 
-  release_renew_slot(slot)
+  concurrency.release("renew_slot:", slot)
 end
 
 -- Kick off a non-blocking background renewal for a single domain. Returns
 -- immediately so the current request is unaffected. Skips (returning false) if
--- the concurrency limit is already reached -- the domain will be retried on a
+-- renew_max_concurrency is already reached -- the domain will be retried on a
 -- later request.
 function _M.renew_domain(auto_ssl_instance, domain)
-  local slot = acquire_renew_slot()
+  local slot = concurrency.acquire("renew_slot:", auto_ssl_instance:get("renew_max_concurrency"), RENEW_SLOT_TTL)
   if not slot then
     return false, "renewal concurrency limit reached"
   end
 
   local ok, err = ngx.timer.at(0, renew_single_domain, auto_ssl_instance, domain, slot)
   if not ok then
-    release_renew_slot(slot)
+    concurrency.release("renew_slot:", slot)
     ngx.log(ngx.ERR, "auto-ssl: failed to create on-demand renewal timer for ", domain, ": ", err)
     return false, err
   end

@@ -53,6 +53,17 @@ function _M.new(options)
     options["renew_check_interval"] = 86400 -- 1 day
   end
 
+  -- Max number of on-demand (traffic-triggered) renewals to run concurrently.
+  if not options["renew_max_concurrency"] then
+    options["renew_max_concurrency"] = 5
+  end
+
+  -- Max number of new-certificate issuances to run concurrently. Left unset
+  -- (nil) by default, meaning unlimited (preserving prior behavior). Set to a
+  -- positive integer to cap concurrent issuance instead of using a custom
+  -- rate-limit in allow_domain.
+  -- options["issue_max_concurrency"] = nil
+
   if not options["hook_server_port"] then
     options["hook_server_port"] = 8999
   end

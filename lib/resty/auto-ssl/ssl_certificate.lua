@@ -1,8 +1,13 @@
+local concurrency = require "resty.auto-ssl.utils.concurrency"
 local http = require "resty.http"
 local lock = require "resty.lock"
 local ocsp = require "ngx.ocsp"
 local ssl = require "ngx.ssl"
 local ssl_provider = require "resty.auto-ssl.ssl_providers.lets_encrypt"
+
+-- TTL on issuance concurrency slots so they auto-release if a worker dies
+-- mid-issuance (preventing the concurrency budget from leaking).
+local ISSUE_SLOT_TTL = 120
 
 local function convert_to_der_and_cache(domain, cert)
   -- Convert certificate from PEM to DER format.
@@ -183,7 +188,23 @@ local function get_cert_der(auto_ssl_instance, domain, ssl_options)
 
   -- Finally, issue a new certificate if one hasn't been found yet.
   if not ssl_options or ssl_options["generate_certs"] ~= false then
+    -- Optionally cap the number of concurrent new-certificate issuances (each
+    -- shells out to dehydrated via sockproc). When issue_max_concurrency is set
+    -- and all slots are busy, skip issuing on this request and serve the
+    -- fallback; the domain will be retried on a subsequent request. This
+    -- replaces the need for a custom rate-limit in allow_domain.
+    local max_issue = auto_ssl_instance:get("issue_max_concurrency")
+    local issue_slot
+    if max_issue then
+      issue_slot = concurrency.acquire("issue_slot:", max_issue, ISSUE_SLOT_TTL)
+      if not issue_slot then
+        return nil, "issuance concurrency limit reached"
+      end
+    end
+
     cert = issue_cert(auto_ssl_instance, storage, domain)
+    concurrency.release("issue_slot:", issue_slot)
+
     if cert and cert["fullchain_pem"] and cert["privkey_pem"] then
       local cert_der, cert_der_err = convert_to_der_and_cache(domain, cert)
       if cert_der_err then
@@ -341,6 +362,8 @@ local function do_ssl(auto_ssl_instance, ssl_options)
   if get_cert_der_err then
     if get_cert_der_err == "domain not allowed" then
       ngx.log(ngx.NOTICE, "auto-ssl: domain not allowed - using fallback - ", domain)
+    elseif get_cert_der_err == "issuance concurrency limit reached" then
+      ngx.log(ngx.NOTICE, "auto-ssl: issuance concurrency limit reached - using fallback - ", domain)
     else
       ngx.log(ngx.ERR, "auto-ssl: could not get certificate for ", domain, " - using fallback - ", get_cert_der_err)
     end
