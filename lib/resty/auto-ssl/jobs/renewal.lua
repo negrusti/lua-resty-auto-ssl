@@ -186,6 +186,13 @@ local function renew_check_cert(auto_ssl_instance, storage, domain)
   if issue_err then
     ngx.log(ngx.ERR, "auto-ssl: issuing renewal certificate failed: ", issue_err)
     delete_cert_if_expired(domain, storage, cert)
+  else
+    -- Invalidate the in-memory DER/OCSP cache so the freshly-issued
+    -- certificate is picked up on the next request, rather than continuing to
+    -- serve the stale cached cert for up to its cache lifetime (1 hour).
+    ngx.shared.auto_ssl:delete("domain:fullchain_der:" .. domain)
+    ngx.shared.auto_ssl:delete("domain:privkey_der:" .. domain)
+    ngx.shared.auto_ssl:delete("domain:ocsp:" .. domain)
   end
 
   renew_check_cert_unlock(domain, storage, local_lock, distributed_lock_value)
@@ -253,6 +260,30 @@ local function renew(premature, auto_ssl_instance)
     end
     return
   end
+end
+
+-- Timer callback to renew a single domain immediately, using the same locking
+-- and renewal logic as the periodic sweep. Intended to be triggered from a
+-- non-blocking timer when a request is served a certificate that is within the
+-- renewal window (see ssl_certificate.lua).
+local function renew_single_domain(premature, auto_ssl_instance, domain)
+  if premature then return end
+
+  local renew_ok, renew_err = pcall(renew_check_cert, auto_ssl_instance, auto_ssl_instance.storage, domain)
+  if not renew_ok then
+    ngx.log(ngx.ERR, "auto-ssl: failed to run on-demand renewal for ", domain, ": ", renew_err)
+  end
+end
+
+-- Kick off a non-blocking background renewal for a single domain. Returns
+-- immediately so the current request is unaffected.
+function _M.renew_domain(auto_ssl_instance, domain)
+  local ok, err = ngx.timer.at(0, renew_single_domain, auto_ssl_instance, domain)
+  if not ok then
+    ngx.log(ngx.ERR, "auto-ssl: failed to create on-demand renewal timer for ", domain, ": ", err)
+    return false, err
+  end
+  return true
 end
 
 function _M.spawn(auto_ssl_instance)

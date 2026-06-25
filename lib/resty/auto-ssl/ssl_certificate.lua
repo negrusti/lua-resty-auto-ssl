@@ -101,6 +101,33 @@ local function issue_cert(auto_ssl_instance, storage, domain)
   return cert, err
 end
 
+-- When a certificate served from storage is within the renewal window (or
+-- already expired, or missing an expiry date), kick off a non-blocking
+-- background renewal. The current request is still served the existing
+-- certificate with zero added latency; once the renewal completes it clears
+-- the in-memory cache so the next request picks up the freshly-issued cert.
+--
+-- A per-domain dedup lock in the shared dict ensures we only trigger one
+-- renewal per domain within the window, rather than spawning a timer (and ACME
+-- attempt) on every request to an expiring/expired domain.
+local RENEW_THRESHOLD = 30 * 24 * 60 * 60
+local RENEW_TRIGGER_DEDUP_TIME = 600
+local function maybe_trigger_renewal(auto_ssl_instance, domain, cert)
+  local expiry = cert["expiry"]
+  if expiry and (expiry - ngx.now()) >= RENEW_THRESHOLD then
+    return
+  end
+
+  local ok = ngx.shared.auto_ssl:add("domain:renew_hit_lock:" .. domain, true, RENEW_TRIGGER_DEDUP_TIME)
+  if not ok then
+    return
+  end
+
+  ngx.log(ngx.NOTICE, "auto-ssl: triggering on-demand renewal for ", domain)
+  local renewal = require "resty.auto-ssl.jobs.renewal"
+  renewal.renew_domain(auto_ssl_instance, domain)
+end
+
 local function get_cert_der(auto_ssl_instance, domain, ssl_options)
   -- Look for the certificate in shared memory first.
   local fullchain_der = ngx.shared.auto_ssl:get("domain:fullchain_der:" .. domain)
@@ -135,12 +162,17 @@ local function get_cert_der(auto_ssl_instance, domain, ssl_options)
   end
 
   if cert and cert["fullchain_pem"] and cert["privkey_pem"] then
+    -- Serve the existing cert, but if it's within the renewal window kick off a
+    -- non-blocking background renewal so expiring/expired certs self-heal on
+    -- access (without waiting for the periodic sweep).
+    maybe_trigger_renewal(auto_ssl_instance, domain, cert)
+
     local cert_der, cert_der_err = convert_to_der_and_cache(domain, cert)
 
     if cert_der_err then
       ngx.log(ngx.ERR, "auto-ssl: error converting certificate for ", domain, ": ", cert_der_err)
     end
-    
+
     if not cert_der then
       return nil, "empty cert_der received"
     end
