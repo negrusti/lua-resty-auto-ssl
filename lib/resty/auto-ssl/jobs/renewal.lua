@@ -182,11 +182,16 @@ local function renew_check_cert(auto_ssl_instance, storage, domain)
   -- Trigger a normal certificate issuance attempt, which dehydrated will
   -- skip if the certificate already exists or renew if it's within the
   -- configured time for renewals.
-  local _, issue_err = ssl_provider.issue_cert(auto_ssl_instance, domain)
+  local renewed_cert, issue_err = ssl_provider.issue_cert(auto_ssl_instance, domain)
   if issue_err then
     ngx.log(ngx.ERR, "auto-ssl: issuing renewal certificate failed: ", issue_err)
     delete_cert_if_expired(domain, storage, cert)
   else
+    -- Log success at NOTICE so completed renewals are visible (issue_cert
+    -- itself only logs at DEBUG on success).
+    local new_expiry = renewed_cert and renewed_cert["expiry"]
+    ngx.log(ngx.NOTICE, "auto-ssl: renewed certificate for ", domain, new_expiry and (" (expiry: " .. new_expiry .. ")") or "")
+
     -- Invalidate the in-memory DER/OCSP cache so the freshly-issued
     -- certificate is picked up on the next request, rather than continuing to
     -- serve the stale cached cert for up to its cache lifetime (1 hour).
