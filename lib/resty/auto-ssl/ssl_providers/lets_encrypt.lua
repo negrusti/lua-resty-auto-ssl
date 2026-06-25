@@ -3,6 +3,34 @@ local _M = {}
 local acme_rate_limit = require "resty.auto-ssl.utils.acme_rate_limit"
 local shell_execute = require "resty.auto-ssl.utils.shell_execute"
 
+-- Parse a "retry after <ISO8601 UTC>" hint out of a Let's Encrypt rate-limit
+-- message and return how many seconds from now that is, or nil if absent or
+-- implausible. LE includes this for several limits (e.g. certificates per
+-- registered domain), letting us back off exactly as long as it asks.
+local function parse_retry_after(text)
+  local y, mon, d, h, mi, s = string.match(text, "retry after (%d%d%d%d)-(%d%d)-(%d%d)[T ](%d%d):(%d%d):(%d%d)")
+  if not y then
+    return nil
+  end
+
+  -- os.time treats the table as local time; LE timestamps are UTC, so add the
+  -- local-to-UTC offset to get a correct epoch.
+  local utc_offset = os.difftime(os.time(), os.time(os.date("!*t")))
+  local target = os.time({
+    year = tonumber(y), month = tonumber(mon), day = tonumber(d),
+    hour = tonumber(h), min = tonumber(mi), sec = tonumber(s), isdst = false,
+  }) + utc_offset
+
+  local seconds = target - ngx.now()
+  if seconds < 60 then
+    return nil
+  elseif seconds > 7 * 24 * 60 * 60 then
+    return 7 * 24 * 60 * 60
+  end
+
+  return seconds
+end
+
 function _M.issue_cert(auto_ssl_instance, domain)
   assert(type(domain) == "string", "domain must be a string")
 
@@ -53,6 +81,23 @@ function _M.issue_cert(auto_ssl_instance, domain)
   _M.cleanup(auto_ssl_instance, domain)
 
   if result["status"] ~= 0 then
+    -- React to Let's Encrypt's actual response rather than a configured guess.
+    local detail = (result["output"] or "") .. " " .. (err or "")
+    if string.find(detail, "rateLimited", 1, true) or string.find(detail, "too many", 1, true) or string.find(detail, "rate limit", 1, true) then
+      -- Account-wide limits (e.g. "too many new orders") should pause all
+      -- orders; per-registered-domain limits ("...already issued for...") only
+      -- affect that domain, so don't back the whole account off for those.
+      local account_wide = string.find(detail, "already issued", 1, true) == nil
+      if account_wide then
+        local backoff = parse_retry_after(detail) or auto_ssl_instance:get("acme_rate_limit_backoff") or 3600
+        acme_rate_limit.backoff(backoff)
+        ngx.log(ngx.WARN, "auto-ssl: Let's Encrypt rate limit hit; backing off all orders for ", backoff, "s (", domain, ")")
+      else
+        ngx.log(ngx.NOTICE, "auto-ssl: Let's Encrypt per-domain rate limit for ", domain)
+      end
+      return nil, "acme rate limit reached"
+    end
+
     ngx.log(ngx.ERR, "auto-ssl: dehydrated failed: ", result["command"], " status: ", result["status"], " out: ", result["output"], " err: ", err)
     return nil, "dehydrated failure"
   end

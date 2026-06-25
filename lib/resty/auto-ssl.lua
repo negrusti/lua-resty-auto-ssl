@@ -73,6 +73,13 @@ function _M.new(options)
     options["acme_order_period"] = 3 * 60 * 60 -- 3 hours, matching LE's window
   end
 
+  -- When Let's Encrypt rate-limits us and provides no parseable "retry after"
+  -- hint, back off all orders for this many seconds before probing LE again.
+  -- This reactive backoff adapts to the account's real limits automatically.
+  if not options["acme_rate_limit_backoff"] then
+    options["acme_rate_limit_backoff"] = 3600 -- 1 hour
+  end
+
   if not options["hook_server_port"] then
     options["hook_server_port"] = 8999
   end
