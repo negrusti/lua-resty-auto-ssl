@@ -98,7 +98,7 @@ local function issue_cert(auto_ssl_instance, storage, domain)
 
   ngx.log(ngx.NOTICE, "auto-ssl: issuing new certificate for ", domain)
   cert, err = ssl_provider.issue_cert(auto_ssl_instance, domain)
-  if err then
+  if err and err ~= "acme rate limit reached" then
     ngx.log(ngx.ERR, "auto-ssl: issuing new certificate failed: ", err)
   end
 
@@ -202,8 +202,13 @@ local function get_cert_der(auto_ssl_instance, domain, ssl_options)
       end
     end
 
-    cert = issue_cert(auto_ssl_instance, storage, domain)
+    local issue_err
+    cert, issue_err = issue_cert(auto_ssl_instance, storage, domain)
     concurrency.release("issue_slot:", issue_slot)
+
+    if issue_err == "acme rate limit reached" then
+      return nil, "acme rate limit reached"
+    end
 
     if cert and cert["fullchain_pem"] and cert["privkey_pem"] then
       local cert_der, cert_der_err = convert_to_der_and_cache(domain, cert)
@@ -364,6 +369,8 @@ local function do_ssl(auto_ssl_instance, ssl_options)
       ngx.log(ngx.NOTICE, "auto-ssl: domain not allowed - using fallback - ", domain)
     elseif get_cert_der_err == "issuance concurrency limit reached" then
       ngx.log(ngx.NOTICE, "auto-ssl: issuance concurrency limit reached - using fallback - ", domain)
+    elseif get_cert_der_err == "acme rate limit reached" then
+      ngx.log(ngx.NOTICE, "auto-ssl: ACME rate limit reached - using fallback - ", domain)
     else
       ngx.log(ngx.ERR, "auto-ssl: could not get certificate for ", domain, " - using fallback - ", get_cert_der_err)
     end

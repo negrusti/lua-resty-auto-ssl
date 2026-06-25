@@ -64,6 +64,15 @@ function _M.new(options)
   -- rate-limit in allow_domain.
   -- options["issue_max_concurrency"] = nil
 
+  -- Account-wide cap on the number of Let's Encrypt orders (issuance AND
+  -- renewal combined, since they share one ACME account/rate limit) allowed per
+  -- acme_order_period. Unset by default (no limit). To stay under LE's 300
+  -- orders / 3 hours, set e.g. max_acme_orders = 250.
+  -- options["max_acme_orders"] = nil
+  if not options["acme_order_period"] then
+    options["acme_order_period"] = 3 * 60 * 60 -- 3 hours, matching LE's window
+  end
+
   if not options["hook_server_port"] then
     options["hook_server_port"] = 8999
   end

@@ -185,8 +185,15 @@ local function renew_check_cert(auto_ssl_instance, storage, domain)
   -- configured time for renewals.
   local renewed_cert, issue_err = ssl_provider.issue_cert(auto_ssl_instance, domain)
   if issue_err then
-    ngx.log(ngx.ERR, "auto-ssl: issuing renewal certificate failed: ", issue_err)
-    delete_cert_if_expired(domain, storage, cert)
+    if issue_err == "acme rate limit reached" then
+      -- Defer rather than fail: leave the existing cert in place (do NOT delete
+      -- even if expired) so it's retried on a later request/sweep once the rate
+      -- limit window clears.
+      ngx.log(ngx.NOTICE, "auto-ssl: renewal deferred, ACME rate limit reached: ", domain)
+    else
+      ngx.log(ngx.ERR, "auto-ssl: issuing renewal certificate failed: ", issue_err)
+      delete_cert_if_expired(domain, storage, cert)
+    end
   else
     -- Log success at NOTICE so completed renewals are visible (issue_cert
     -- itself only logs at DEBUG on success).
